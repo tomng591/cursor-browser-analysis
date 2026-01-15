@@ -12,185 +12,7 @@ FastRender is a production-quality browser rendering engine written primarily wi
 
 ---
 
-## Part 1: Architecture & Code Structure
-
-### Repository Structure
-
-```
-cursor-full-ai-written-browser/
-├── AGENTS.md           # Master instructions for AI agents working on the codebase
-├── Cargo.toml          # Main workspace definition (~620 lines)
-├── src/                # Main renderer crate (87 items, 1.38M lines)
-│   ├── api.rs          # Main orchestration (1.26MB!)
-│   ├── dom.rs          # DOM tree (663KB)
-│   ├── dom2/           # vm-js backed DOM implementation
-│   ├── layout/         # Layout algorithms (282K lines)
-│   ├── paint/          # Painting/rasterization (208K lines)
-│   ├── style/          # CSS cascade/computation (157K lines)
-│   ├── js/             # JavaScript integration (213K lines)
-│   ├── text/           # Text shaping/fonts (54K lines)
-│   ├── ui/             # Browser chrome UI (137 items)
-│   ├── ipc/            # Inter-process communication
-│   ├── sandbox/        # OS-level sandboxing (Linux/macOS/Windows)
-│   ├── bin/            # 38 binary entrypoints
-│   └── ...
-├── crates/             # Supporting crates
-│   ├── fastrender-renderer/
-│   ├── fastrender-ipc/
-│   ├── fastrender-shmem/
-│   ├── fastrender-yuv/
-│   ├── js-wpt-dom-runner/
-│   ├── win-sandbox/
-│   └── libvpx-sys-bundled/   # VP9 codec
-├── vendor/             # Vendored dependencies
-│   ├── ecma-rs/        # JavaScript engine (vm-js)
-│   ├── taffy/          # Flex/grid layout
-│   ├── selectors/      # CSS selector matching
-│   └── cmake/
-├── docs/               # 90+ documentation files
-├── instructions/       # AI workstream instructions
-├── tests/              # Unit, integration, WPT, fixture tests
-├── specs/              # Linked WHATWG/TC39/CSS specs
-├── progress/           # Pageset accuracy tracking JSON
-├── scripts/            # Build/test helper scripts
-├── benches/            # Performance benchmarks (27 benchmarks)
-├── tools/              # WebIDL processing, Unicode data
-├── fuzz/               # CSS/selector fuzzing
-└── xtask/              # Custom build commands
-```
-
-### Rendering Pipeline
-
-The rendering pipeline follows the standard browser model:
-
-```
-HTML Parse → DOM Tree → CSS Parse → Cascade/Compute → Box Tree → Layout → Paint → Rasterize
-```
-
-**Key structures:**
-
-| Stage | Structure | Description |
-|-------|-----------|-------------|
-| DOM | `DomNode`, `dom2/` | Traditional DOM and JavaScript-backed implementation |
-| Styled Tree | `StyledNode` | Computed CSS values |
-| Box Tree | `BoxTree`/`BoxNode` | Anonymous box fixup |
-| Fragment Tree | `FragmentTree`/`FragmentNode` | Supports pagination/columns |
-| Display List | Paint commands | tiny-skia rasterization |
-
-### Multi-Process Architecture
-
-The browser is moving toward Chromium-style process isolation:
-
-| Process | Responsibility |
-|---------|----------------|
-| Browser process | Chrome UI, tab management |
-| Renderer process | Sandboxed per-site content rendering |
-| Network process | Isolated network stack |
-| Site isolation | Per-origin renderer processes (OOPIF for cross-origin frames) |
-
-**Platform-specific sandbox implementations:**
-
-| Platform | Technologies |
-|----------|--------------|
-| Linux | Namespaces + Landlock + seccomp-bpf |
-| macOS | Seatbelt (App Sandbox profiles) |
-| Windows | AppContainer + Job Objects + restricted tokens |
-
-### Key Technical Decisions
-
-#### 1. Mega-Crate Architecture
-
-Everything is in one crate (`fastrender`). This makes builds slow but keeps dependencies simple. The team has analyzed splitting it but decided the cost/benefit doesn't justify it yet.
-
-#### 2. Vendored JavaScript Engine
-
-Uses `vendor/ecma-rs/`—a custom JavaScript engine called vm-js:
-
-- Full ECMAScript support (modules, async/await, generators)
-- WebIDL bindings (auto-generated from spec IDL files)
-- HTML script processing model (parser-blocking, defer, async, modules)
-- Event loop with microtasks/macrotasks
-
-#### 3. No Page-Specific Hacks
-
-A core philosophy: *"No hostname checks, no magic numbers for one site."* If a page doesn't render correctly, the fix must be a proper spec implementation.
-
-#### 4. Bounded Execution
-
-All JavaScript execution is interruptible with fuel-based budgets. Memory allocations are bounded. Tests run under `timeout -k` to kill runaway processes.
-
-#### 5. Vendored Layout Engine
-
-Uses `vendor/taffy/` for flex/grid layout (fork of the Taffy layout library). Table/block/inline layout is custom.
-
-### Build System
-
-The project uses standard Cargo but with strict guardrails:
-
-```bash
-# NEVER run raw cargo commands - use the wrapper
-bash scripts/cargo_agent.sh build --release --bin browser
-
-# Always scope builds to specific targets
-bash scripts/cargo_agent.sh test -p fastrender --lib
-
-# Always use timeouts (processes can hang)
-timeout -k 10 600 bash scripts/cargo_agent.sh test --test integration
-```
-
-**Key features:**
-
-- `--features browser_ui` enables the desktop GUI (winit + wgpu + egui)
-- `--features vmjs` enables JavaScript execution
-- `--profile release-max` for final distribution (LTO, single codegen unit—extremely slow)
-
-**Build times:**
-
-| Build Type | Cold | Incremental |
-|------------|------|-------------|
-| Type check | 10-30s | ~1s |
-| Release binary | ~90s | ~1s |
-| Release-max (all targets) | 30-60 minutes | — |
-
-### Testing Infrastructure
-
-Comprehensive testing at every level:
-
-| Test Type | Description |
-|-----------|-------------|
-| Unit tests | In `src/` alongside code (`cargo test --lib`) |
-| Integration tests | Exactly 2 binaries (`integration.rs`, `allocation_failure.rs`) |
-| Visual fixtures | HTML → PNG golden comparisons |
-| WPT harness | Web Platform Tests (local subset) |
-| Chrome comparison | Automated diff reports against Chrome renders |
-| test262 | JavaScript parser conformance |
-| Fuzzing | CSS parsing, selector matching |
-
-Pageset accuracy is tracked in committed JSON files under `progress/pages/*.json`.
-
-### Development Workflow
-
-```bash
-# Development workflow
-bash scripts/cargo_agent.sh check -p fastrender          # Fast type-check
-bash scripts/cargo_agent.sh test -p fastrender --lib     # Unit tests
-bash scripts/cargo_agent.sh build --release --bin browser --features browser_ui
-
-# Run the browser
-./target/release/browser https://example.com
-
-# Render a page to PNG
-bash scripts/cargo_agent.sh run --release --bin fetch_and_render -- https://example.com out.png
-
-# Compare against Chrome
-bash scripts/cargo_agent.sh xtask fixture-chrome-diff
-```
-
-The `xtask` crate provides high-level commands: `pageset`, `update-goldens`, `render-page`, `fixture-chrome-diff`, etc.
-
----
-
-## Part 2: Development History & Process
+## Part 1: Development History & Process
 
 ### Timeline & Velocity Overview
 
@@ -515,6 +337,184 @@ Based on systematic sampling:
 - **WebM demuxer** — Audio/video container
 - **seccomp-bpf sandbox** — Linux security
 - **Landlock filesystem sandbox** — Linux security
+
+---
+
+## Part 2: Architecture & Code Structure
+
+### Repository Structure
+
+```
+cursor-full-ai-written-browser/
+├── AGENTS.md           # Master instructions for AI agents working on the codebase
+├── Cargo.toml          # Main workspace definition (~620 lines)
+├── src/                # Main renderer crate (87 items, 1.38M lines)
+│   ├── api.rs          # Main orchestration (1.26MB!)
+│   ├── dom.rs          # DOM tree (663KB)
+│   ├── dom2/           # vm-js backed DOM implementation
+│   ├── layout/         # Layout algorithms (282K lines)
+│   ├── paint/          # Painting/rasterization (208K lines)
+│   ├── style/          # CSS cascade/computation (157K lines)
+│   ├── js/             # JavaScript integration (213K lines)
+│   ├── text/           # Text shaping/fonts (54K lines)
+│   ├── ui/             # Browser chrome UI (137 items)
+│   ├── ipc/            # Inter-process communication
+│   ├── sandbox/        # OS-level sandboxing (Linux/macOS/Windows)
+│   ├── bin/            # 38 binary entrypoints
+│   └── ...
+├── crates/             # Supporting crates
+│   ├── fastrender-renderer/
+│   ├── fastrender-ipc/
+│   ├── fastrender-shmem/
+│   ├── fastrender-yuv/
+│   ├── js-wpt-dom-runner/
+│   ├── win-sandbox/
+│   └── libvpx-sys-bundled/   # VP9 codec
+├── vendor/             # Vendored dependencies
+│   ├── ecma-rs/        # JavaScript engine (vm-js)
+│   ├── taffy/          # Flex/grid layout
+│   ├── selectors/      # CSS selector matching
+│   └── cmake/
+├── docs/               # 90+ documentation files
+├── instructions/       # AI workstream instructions
+├── tests/              # Unit, integration, WPT, fixture tests
+├── specs/              # Linked WHATWG/TC39/CSS specs
+├── progress/           # Pageset accuracy tracking JSON
+├── scripts/            # Build/test helper scripts
+├── benches/            # Performance benchmarks (27 benchmarks)
+├── tools/              # WebIDL processing, Unicode data
+├── fuzz/               # CSS/selector fuzzing
+└── xtask/              # Custom build commands
+```
+
+### Rendering Pipeline
+
+The rendering pipeline follows the standard browser model:
+
+```
+HTML Parse → DOM Tree → CSS Parse → Cascade/Compute → Box Tree → Layout → Paint → Rasterize
+```
+
+**Key structures:**
+
+| Stage | Structure | Description |
+|-------|-----------|-------------|
+| DOM | `DomNode`, `dom2/` | Traditional DOM and JavaScript-backed implementation |
+| Styled Tree | `StyledNode` | Computed CSS values |
+| Box Tree | `BoxTree`/`BoxNode` | Anonymous box fixup |
+| Fragment Tree | `FragmentTree`/`FragmentNode` | Supports pagination/columns |
+| Display List | Paint commands | tiny-skia rasterization |
+
+### Multi-Process Architecture
+
+The browser is moving toward Chromium-style process isolation:
+
+| Process | Responsibility |
+|---------|----------------|
+| Browser process | Chrome UI, tab management |
+| Renderer process | Sandboxed per-site content rendering |
+| Network process | Isolated network stack |
+| Site isolation | Per-origin renderer processes (OOPIF for cross-origin frames) |
+
+**Platform-specific sandbox implementations:**
+
+| Platform | Technologies |
+|----------|--------------|
+| Linux | Namespaces + Landlock + seccomp-bpf |
+| macOS | Seatbelt (App Sandbox profiles) |
+| Windows | AppContainer + Job Objects + restricted tokens |
+
+### Key Technical Decisions
+
+#### 1. Mega-Crate Architecture
+
+Everything is in one crate (`fastrender`). This makes builds slow but keeps dependencies simple. The team has analyzed splitting it but decided the cost/benefit doesn't justify it yet.
+
+#### 2. Vendored JavaScript Engine
+
+Uses `vendor/ecma-rs/`—a custom JavaScript engine called vm-js:
+
+- Full ECMAScript support (modules, async/await, generators)
+- WebIDL bindings (auto-generated from spec IDL files)
+- HTML script processing model (parser-blocking, defer, async, modules)
+- Event loop with microtasks/macrotasks
+
+#### 3. No Page-Specific Hacks
+
+A core philosophy: *"No hostname checks, no magic numbers for one site."* If a page doesn't render correctly, the fix must be a proper spec implementation.
+
+#### 4. Bounded Execution
+
+All JavaScript execution is interruptible with fuel-based budgets. Memory allocations are bounded. Tests run under `timeout -k` to kill runaway processes.
+
+#### 5. Vendored Layout Engine
+
+Uses `vendor/taffy/` for flex/grid layout (fork of the Taffy layout library). Table/block/inline layout is custom.
+
+### Build System
+
+The project uses standard Cargo but with strict guardrails:
+
+```bash
+# NEVER run raw cargo commands - use the wrapper
+bash scripts/cargo_agent.sh build --release --bin browser
+
+# Always scope builds to specific targets
+bash scripts/cargo_agent.sh test -p fastrender --lib
+
+# Always use timeouts (processes can hang)
+timeout -k 10 600 bash scripts/cargo_agent.sh test --test integration
+```
+
+**Key features:**
+
+- `--features browser_ui` enables the desktop GUI (winit + wgpu + egui)
+- `--features vmjs` enables JavaScript execution
+- `--profile release-max` for final distribution (LTO, single codegen unit—extremely slow)
+
+**Build times:**
+
+| Build Type | Cold | Incremental |
+|------------|------|-------------|
+| Type check | 10-30s | ~1s |
+| Release binary | ~90s | ~1s |
+| Release-max (all targets) | 30-60 minutes | — |
+
+### Testing Infrastructure
+
+Comprehensive testing at every level:
+
+| Test Type | Description |
+|-----------|-------------|
+| Unit tests | In `src/` alongside code (`cargo test --lib`) |
+| Integration tests | Exactly 2 binaries (`integration.rs`, `allocation_failure.rs`) |
+| Visual fixtures | HTML → PNG golden comparisons |
+| WPT harness | Web Platform Tests (local subset) |
+| Chrome comparison | Automated diff reports against Chrome renders |
+| test262 | JavaScript parser conformance |
+| Fuzzing | CSS parsing, selector matching |
+
+Pageset accuracy is tracked in committed JSON files under `progress/pages/*.json`.
+
+### Development Workflow
+
+```bash
+# Development workflow
+bash scripts/cargo_agent.sh check -p fastrender          # Fast type-check
+bash scripts/cargo_agent.sh test -p fastrender --lib     # Unit tests
+bash scripts/cargo_agent.sh build --release --bin browser --features browser_ui
+
+# Run the browser
+./target/release/browser https://example.com
+
+# Render a page to PNG
+bash scripts/cargo_agent.sh run --release --bin fetch_and_render -- https://example.com out.png
+
+# Compare against Chrome
+bash scripts/cargo_agent.sh xtask fixture-chrome-diff
+```
+
+The `xtask` crate provides high-level commands: `pageset`, `update-goldens`, `render-page`, `fixture-chrome-diff`, etc.
 
 ---
 
